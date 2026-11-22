@@ -199,39 +199,26 @@ static void mul_mat_id_repacked_impl(ggml_backend_cuda_context & ctx,
     // Tile width follows the average expert load: a narrow tile at P=512
     // (n_expert_used * n_tokens / n_expert ~= 16) does not spend half its MACs on
     // empty columns, a wider one at long prompts does not read the expert weights twice.
-    const int64_t avg = (n_assign + ne02 - 1) / ne02;
-    const int     BN  = avg <= 32 ? 32 : avg <= 64 ? 64 : 64 * MMQ_RP_Q8_TN;
+    // Fixed 32-wide tile. Measured on Qwen3.6-35B-A3B IQ4_NL, 2x MI50,
+    // -sm tensor: pp at ub 2048 2854 t/s and at pp4096 2749, against 2578 and
+    // 2480 for a 64-wide tile and 2522 for 128 at pp4096. The load-based
+    // 32/64/128 selection this replaces was only ever exercised at ub 512
+    // (avg 16 -> 32); its 64-wide instantiation is the narrow CW=32/TN=2 tile,
+    // which is 2.5x slower than 32 at ub 2048.
+    constexpr int BN = 32;
 
     const int64_t max_tiles = n_assign / BN + ne02;
     ggml_cuda_pool_alloc<int32_t>          tile_off (ctx.pool(), ne02 + 1);
     ggml_cuda_pool_alloc<repack_tile_meta> tile_meta(ctx.pool(), max_tiles);
-    switch (BN) {
-        case 32:  repack_tile_off<32 ><<<1, 1, 0, stream>>>(expert_bounds.get(), tile_off.get(), tile_meta.get(), ne02); break;
-        case 64:  repack_tile_off<64 ><<<1, 1, 0, stream>>>(expert_bounds.get(), tile_off.get(), tile_meta.get(), ne02); break;
-        default:  repack_tile_off<128><<<1, 1, 0, stream>>>(expert_bounds.get(), tile_off.get(), tile_meta.get(), ne02); break;
-    }
+    repack_tile_off<BN><<<1, 1, 0, stream>>>(expert_bounds.get(), tile_off.get(), tile_meta.get(), ne02);
 
     switch (src0->type) {
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_IQ4_NL: {
-            switch (BN) {
-                case 32:
-                    repack_gemm_launch<true, 32, 1, MMQ_RP_Q8_NROW_LANES * 2>(src0->type, stream, w, xq, dst_d,
-                        (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols, ids_src1.get(), ids_dst.get(),
-                        expert_bounds.get(), tile_off.get(), tile_meta.get(), (uint32_t) ne02, expert_stride, dst_s1, max_tiles);
-                    break;
-                case 64:
-                    repack_gemm_launch<true, 32, 2, MMQ_RP_Q8_NROW_LANES * 2>(src0->type, stream, w, xq, dst_d,
-                        (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols, ids_src1.get(), ids_dst.get(),
-                        expert_bounds.get(), tile_off.get(), tile_meta.get(), (uint32_t) ne02, expert_stride, dst_s1, max_tiles);
-                    break;
-                default:
-                    repack_gemm_launch<true, 64, MMQ_RP_Q8_TN, MMQ_RP_Q8_NROW_LANES>(src0->type, stream, w, xq, dst_d,
-                        (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols, ids_src1.get(), ids_dst.get(),
-                        expert_bounds.get(), tile_off.get(), tile_meta.get(), (uint32_t) ne02, expert_stride, dst_s1, max_tiles);
-                    break;
-            }
+            repack_gemm_launch<true, 32, 1, MMQ_RP_Q8_NROW_LANES * 2>(src0->type, stream, w, xq, dst_d,
+                (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols, ids_src1.get(), ids_dst.get(),
+                expert_bounds.get(), tile_off.get(), tile_meta.get(), (uint32_t) ne02, expert_stride, dst_s1, max_tiles);
         } break;
         default:
             GGML_ABORT("unsupported repack type");
