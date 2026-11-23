@@ -16,6 +16,26 @@ static void ggml_cuda_mul_mat_repacked_nc_t(
         const int64_t ne00, const int64_t ne01, const int64_t ne11,
         const uint32_t xs, const uint32_t ys, cudaStream_t stream);
 
+// Dense multi-token GEMM for one token-tile width: 32 uses the narrow kernel,
+// 64 and 128 the 64-wide one at TN 1 and 2 (BN = 64 * TN).
+template <ggml_type WT>
+static void repack_dense_gemm_launch(cudaStream_t stream,
+        const uint8_t * w, const block_q8_1 * xq, float * y,
+        const uint32_t ne0, const uint32_t ne1, const uint32_t n_tok,
+        const int bn, const dim3 & grid) {
+    constexpr int nrl = MMQ_RP_Q8_NROW_LANES;
+    if (bn <= 32) {
+        mmq_gemm_repacked_narrow<false, 32, 1, nrl * 2, WT><<<grid, dim3(32, nrl * 2), 0, stream>>>(
+            w, xq, y, ne0, ne1, n_tok, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, ne1);
+    } else if (bn <= 64) {
+        mmq_gemm_repacked<false, 1, nrl, WT><<<grid, dim3(64, nrl), 0, stream>>>(
+            w, xq, y, ne0, ne1, n_tok, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, ne1);
+    } else {
+        mmq_gemm_repacked<false, MMQ_RP_Q8_TN, nrl, WT><<<grid, dim3(64, nrl), 0, stream>>>(
+            w, xq, y, ne0, ne1, n_tok, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, ne1);
+    }
+}
+
 void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
@@ -330,53 +350,38 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
         return;
     }
 
-    // Multi-token: 64-wide GEMM for large batches, 32-wide for small ones.
-    const int nrl  = MMQ_RP_Q8_NROW_LANES;
+    // Multi-token. The token tile picks between parallelism and weight reuse:
+    // a 128-wide tile on a short batch of a small matrix leaves the CUs idle,
+    // while a 32-wide tile on a long batch re-reads the weights four times.
+    // Measured on Qwen3.6-35B-A3B (M 2048/512/4096, ub 512) the narrow tile is
+    // +4%; on the 9B (M >= 4096) and at ub >= 1024 the wide tile wins, and the
+    // 9B loses 24% if the narrow one is forced. GGML_RP_DENSE_BN overrides it.
+    const int nrl = MMQ_RP_Q8_NROW_LANES;
     const int mmq_bm = MMQ_RP_Q8_BM;
-    if (ne11 >= 128) {
-        const int bn = 64 * MMQ_RP_Q8_TN;
-        const dim3 grid((ne01 + mmq_bm - 1) / mmq_bm,
-                        (ne11 + bn - 1) / bn, 1);
-        switch (src0->type) {
-            case GGML_TYPE_Q8_0:
-                mmq_gemm_repacked<false, MMQ_RP_Q8_TN, nrl, GGML_TYPE_Q8_0><<<grid, dim3(64, nrl), 0, stream>>>(
-                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
-                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
-                break;
-            case GGML_TYPE_IQ4_NL:
-                mmq_gemm_repacked<false, MMQ_RP_Q8_TN, nrl, GGML_TYPE_IQ4_NL><<<grid, dim3(64, nrl), 0, stream>>>(
-                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
-                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
-                break;
-            case GGML_TYPE_Q4_0:
-                mmq_gemm_repacked<false, MMQ_RP_Q8_TN, nrl, GGML_TYPE_Q4_0><<<grid, dim3(64, nrl), 0, stream>>>(
-                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
-                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
-                break;
-            default: GGML_ABORT("unsupported repack type");
-        }
-    } else {
-        const int bn = 32;
-        const dim3 grid((ne01 + mmq_bm - 1) / mmq_bm,
-                        (ne11 + bn - 1) / bn, 1);
-        switch (src0->type) {
-            case GGML_TYPE_Q8_0:
-                mmq_gemm_repacked_narrow<false, 32, 1, nrl*2, GGML_TYPE_Q8_0><<<grid, dim3(32, nrl*2), 0, stream>>>(
-                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
-                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
-                break;
-            case GGML_TYPE_IQ4_NL:
-                mmq_gemm_repacked_narrow<false, 32, 1, nrl*2, GGML_TYPE_IQ4_NL><<<grid, dim3(32, nrl*2), 0, stream>>>(
-                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
-                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
-                break;
-            case GGML_TYPE_Q4_0:
-                mmq_gemm_repacked_narrow<false, 32, 1, nrl*2, GGML_TYPE_Q4_0><<<grid, dim3(32, nrl*2), 0, stream>>>(
-                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
-                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
-                break;
-            default: GGML_ABORT("unsupported repack type");
-        }
+    static const int bn_env = [] {
+        const char * e = getenv("GGML_RP_DENSE_BN");
+        return e ? atoi(e) : 0;
+    }();
+    const int row_tiles = (int) ((ne01 + mmq_bm - 1) / mmq_bm);
+    // Below 128 tokens a 128-wide token tile spends most of its columns on
+    // padding, whatever the matrix size.
+    const bool starved = ne11 < 128 || (ne11 <= 512 && row_tiles <= 32);
+    const int bn = bn_env ? bn_env : (starved ? 32 : 128);
+    const dim3 grid((ne01 + mmq_bm - 1) / mmq_bm, (ne11 + bn - 1) / bn, 1);
+    switch (src0->type) {
+        case GGML_TYPE_Q8_0:
+            repack_dense_gemm_launch<GGML_TYPE_Q8_0>(stream, w, xq, dst_d,
+                (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, bn, grid);
+            break;
+        case GGML_TYPE_IQ4_NL:
+            repack_dense_gemm_launch<GGML_TYPE_IQ4_NL>(stream, w, xq, dst_d,
+                (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, bn, grid);
+            break;
+        case GGML_TYPE_Q4_0:
+            repack_dense_gemm_launch<GGML_TYPE_Q4_0>(stream, w, xq, dst_d,
+                (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, bn, grid);
+            break;
+        default: GGML_ABORT("unsupported repack type");
     }
     GGML_UNUSED(ctx);
 }
