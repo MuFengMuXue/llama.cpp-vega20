@@ -513,6 +513,70 @@ on `cc == VEGA20 && ncols_dst == 1 && !ids`. No PR, no numbers, and no effect
 on us for the same reason as above: the repack MMV already runs one row per
 wave. Worth a look only for K-quant decode.
 
+### `HerRei/gfx906-decode-kernels` (MIT, AI-assisted, test-backend-ops checked)
+
+A 162-line patch to `mmvq.cu` plus a flash-decoding kernel, measured on a
+Radeon VII at stock clocks.
+
+The matvec covers Q4_0, Q4_1 and IQ4_NL in the canonical block layout, with
+expert ids and the fused gate, and picks lanes-per-row against rows-per-block
+per shape (16x8 for experts, 2x64 under 2048 rows, 8x16 for K under 2048, 4x32
+otherwise), always in 128-thread workgroups. 49 shapes at 512+ rows: median
+-14% (Q4_0), -18% (Q4_1), -15% (IQ4_NL) per matvec. Whole model: +10% on a
+Q4_0 MoE, +3% on a 27B IQ4_NL, prompt processing flat, PPL 6.031 -> 6.034.
+
+It patches `mmvq.cu`, which our IQ4_NL decode does not use, so it only applies
+with `--repack 0`. What is worth taking is the geometry and three findings:
+
+- a 64-thread workgroup grid floors at about 57 us once it reaches about 2048
+  workgroups, whatever the matrix size; 128 threads does not. Our dense MMV
+  runs 1024-thread workgroups and the MoE one 256, so we should not sit on that
+  floor, but it is the first thing to check if a small decode kernel looks slow.
+- IQ4_NL is compute bound on this card, not memory bound: a higher memory clock
+  changed nothing, a higher core clock did. Q4_1 is the fastest 4-bit format
+  here, Q4_0 next, IQ4_NL 3-8% behind on the same shape.
+- Q8_0 did not get faster with their layout and is not covered.
+
+Their flash decoding handles head size 128 with 3 query heads per KV head over a
+q8_0 cache (32k: 407 -> 226 us, 64k: 787 -> 453 us, below 6144 keys it defers).
+Our attention instantiates at head size 256, so that kernel does not fit; see
+Martin1701 for the matching shape.
+
+### `Martin1701/MI50-llama.cpp` (attention for our shape)
+
+gfx906 attention kernel with head size 256 and 6 query heads per KV head sharing
+the q8_0 key/value loads, on upstream's split and combine. That matches the
+shape our model runs (`flash_attn_tile<256, 256, ...>`), so this is the reference
+for long-context decode, not the head-128 kernel above.
+
+### `iacopPBK/gfx906-quartz` (standalone engine, architecture only)
+
+A from-scratch inference engine for two gfx906 cards, Q8_0 GGUF only (other
+quantisations are refused), Qwen3.8-27B class models. Runs 2x MI50 at 135 W:
+pp2048 777 vs llama.cpp 654 at 0 context, 631 vs 499 at 16k, PPL 5.16 vs 5.18.
+
+The architecture is the part that matters, because it is the answer to what our
+profile shows:
+
+- weights halved across the cards, and after each layer the cards write their
+  partial sums straight into each other's memory over PCIe. No NCCL, no per-op
+  launch: our decode makes 161 allreduce calls per token.
+- decode is one persistent kernel per card for the whole model, every block
+  resident, synchronised with a grid barrier (hence the 60-CU requirement).
+  That removes the per-op launches and the graph replays too.
+- decode always runs 3-4 rows (its own MTP layer) or 8-12 rows (a drafter), so
+  it never decodes a single token. This is why that small-batch region matters.
+
+Two cautions: it needs 32 GB cards (59 GB total at 256k with the drafter) and it
+refuses anything but Q8_0, so it cannot run our 35B mix on 16 GB cards. Take the
+structure, not the code.
+
+Our Q8_0 path is real and is not marginal: the repack covers Q8_0, the 35B mix
+runs Q8_0 for every non-expert tensor (the dense repack GEMM is 23% of prefill
+in the profile above), and the 9B dense Q8 measures pp512 1240 / tg128 58.5. An
+int8 path without the IQ4_NL table lookup is therefore where part of that 23%
+could move, which is the same conclusion quartz reaches from the other side.
+
 ## Environment notes
 
 - `-c 8` perplexity OOMs during context allocation, with and without
