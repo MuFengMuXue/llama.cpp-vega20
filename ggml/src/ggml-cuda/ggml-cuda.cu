@@ -988,9 +988,69 @@ static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
+// Most entries needed at once is small: an activation is read by the matmuls of
+// one sub-layer before the next activation takes over.
+#define GGML_CUDA_Q8_1_CACHE_MAX_ENTRIES 2
+
+static bool ggml_cuda_q8_1_cache_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_Q8_1_CACHE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+char * ggml_cuda_q8_1_cache_acquire(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const int variant,
+        const int64_t ne_padded, const int64_t s11, const int64_t s12, const int64_t s13,
+        const size_t nbytes, bool & hit) {
+    hit = false;
+    if (!ggml_cuda_q8_1_cache_enabled() || src1 == nullptr) {
+        return nullptr;
+    }
+
+    for (const ggml_backend_cuda_context::q8_1_cache_entry & e : ctx.q8_1_cache) {
+        if (e.src1 == src1 && e.data == src1->data && e.variant == variant &&
+            e.ne_padded == ne_padded && e.nbytes == nbytes &&
+            e.stride[0] == s11 && e.stride[1] == s12 && e.stride[2] == s13 &&
+            e.ne[0] == src1->ne[0] && e.ne[1] == src1->ne[1] &&
+            e.ne[2] == src1->ne[2] && e.ne[3] == src1->ne[3]) {
+            hit = true;
+            return e.buf;
+        }
+    }
+
+    // Drop the oldest entries first, which are the ones furthest from any node
+    // still to be executed and so the least likely to be asked for again.
+    while (ctx.q8_1_cache.size() >= GGML_CUDA_Q8_1_CACHE_MAX_ENTRIES) {
+        ctx.q8_1_cache.erase(ctx.q8_1_cache.begin());
+    }
+
+    ggml_backend_cuda_context::q8_1_cache_entry e;
+    e.alloc = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool());
+    e.buf   = e.alloc->alloc(nbytes);
+    e.src1      = src1;
+    e.data      = src1->data;
+    e.ne[0]     = src1->ne[0];
+    e.ne[1]     = src1->ne[1];
+    e.ne[2]     = src1->ne[2];
+    e.ne[3]     = src1->ne[3];
+    e.stride[0] = s11;
+    e.stride[1] = s12;
+    e.stride[2] = s13;
+    e.ne_padded = ne_padded;
+    e.nbytes    = nbytes;
+    e.variant   = variant;
+    ctx.q8_1_cache.push_back(std::move(e));
+
+    return ctx.q8_1_cache.back().buf;
+}
+
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+
+    q8_1_cache_reset();
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
@@ -5595,6 +5655,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     // the repack upload scratch lives only between model load and first compute
     ggml_cuda_repack_async_release(cuda_ctx->device);
+
+    // activation quantization is cached for the duration of one graph evaluation
+    cuda_ctx->q8_1_cache_reset();
 
     ggml_cuda_set_device(cuda_ctx->device);
 

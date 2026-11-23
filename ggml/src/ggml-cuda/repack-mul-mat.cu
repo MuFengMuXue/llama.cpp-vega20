@@ -113,8 +113,12 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     const uint64_t n_groups   = (uint64_t) ne10_padded / (4 * QK8_1);
 
     const int64_t chunk_ne11 = ne11;
-    ggml_cuda_pool_alloc<block_q8_1_mmq_h> src1_q8_1(ctx.pool(),
-        (size_t) ne13 * ne12 * ne11 * n_groups);
+    ggml_cuda_pool_alloc<block_q8_1_mmq_h> src1_q8_1;
+    const ggml_type x_type = repack_mmq_x_type(src0->type);
+    const int x_variant  = 1 + (int) mmq_get_q8_1_ds_layout(x_type);
+    block_q8_1 * src1_q8_1_d = repack_quantize_mmq_q8_1(ctx, src1, x_type, x_variant,
+        ne10, ne10_padded, src1->nb[1] / sizeof(float), src1->nb[2] / sizeof(float), src1->nb[3] / sizeof(float),
+        ne11, ne12, ne13, (size_t) ne13 * ne12 * ne11 * n_groups, src1_q8_1, stream);
 
     const int64_t s11 = src1->nb[1] / sizeof(float);
     const int64_t s12 = src1->nb[2] / sizeof(float);
@@ -122,12 +126,10 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     const uint32_t dst_s1 = dst->nb[1] / sizeof(float);
     for (int64_t col = 0; col < ne11; col += chunk_ne11) {
         const int64_t iter_ne11 = std::min(chunk_ne11, ne11 - col);
-        quantize_mmq_q8_1_cuda((const float *) src1->data + col*s11, nullptr, src1_q8_1.get(),
-            repack_mmq_x_type(src0->type), ne10, s11, s12, s13, ne10_padded, iter_ne11, ne12, ne13, stream);
 
         for (int64_t i3 = 0; i3 < ne13; i3++) {
         for (int64_t i2 = 0; i2 < ne12; i2++) {
-            const block_q8_1_mmq_h * slice_base = src1_q8_1.get()
+            const block_q8_1_mmq_h * slice_base = reinterpret_cast<const block_q8_1_mmq_h *>(src1_q8_1_d)
                                   + (i3 * ne12 + i2) * iter_ne11 * n_groups;
             const block_q8_1 * xq = reinterpret_cast<const block_q8_1 *>(slice_base);
             float * dst_d = (float *)((char *) dst->data + i3 * dst->nb[3] + i2 * dst->nb[2])

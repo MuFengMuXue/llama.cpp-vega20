@@ -194,12 +194,12 @@ static void mul_mat_id_repacked_impl(ggml_backend_cuda_context & ctx,
     CUDA_CHECK(cudaGetLastError());
 
     const uint64_t n_groups = (uint64_t) ne10_padded / (4 * QK8_1);
-    ggml_cuda_pool_alloc<char> xq_buf(ctx.pool(),
-        (size_t) n_cols * n_groups * sizeof(block_q8_1_mmq_h));
-    quantize_mmq_q8_1_cuda((const float *) src1->data, nullptr, xq_buf.get(),
-        repack_mmq_x_type(src0->type), ne10, s11, s11 * n_cols, s11 * n_cols, ne10_padded,
-        n_cols, 1, 1, stream);
-    const block_q8_1 * xq = (const block_q8_1 *) xq_buf.get();
+    ggml_cuda_pool_alloc<block_q8_1_mmq_h> xq_buf;
+    const ggml_type x_type = repack_mmq_x_type(src0->type);
+    const block_q8_1 * xq = repack_quantize_mmq_q8_1(ctx, src1, x_type,
+        1 + (int) mmq_get_q8_1_ds_layout(x_type), ne10, ne10_padded,
+        s11, s11 * n_cols, s11 * n_cols, n_cols, 1, 1,
+        (size_t) n_cols * n_groups, xq_buf, stream);
 
     // Tile width follows the average expert load: a narrow tile at P=512
     // (n_expert_used * n_tokens / n_expert ~= 16) does not spend half its MACs on

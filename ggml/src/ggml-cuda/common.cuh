@@ -1445,6 +1445,26 @@ struct ggml_backend_cuda_context {
 
     cudaStream_t stream() { return stream(device, curr_stream_no); }
 
+    // Quantized copies of activations already produced during this graph
+    // evaluation, so repeated matmuls off one activation quantize it once.
+    struct q8_1_cache_entry {
+        const ggml_tensor * src1 = nullptr;
+        const void *        data = nullptr;
+        int64_t             ne[4]     = { 0, 0, 0, 0 };
+        int64_t             stride[3] = { 0, 0, 0 };
+        int64_t             ne_padded = 0;
+        size_t              nbytes    = 0;
+        int                 variant   = -1;
+        char *              buf       = nullptr;
+        // ggml_cuda_pool_alloc deletes both copy and move, so it cannot be held
+        // by value in a vector - the indirection is required, not stylistic.
+        std::unique_ptr<ggml_cuda_pool_alloc<char>> alloc;
+    };
+    std::vector<q8_1_cache_entry> q8_1_cache;
+    void q8_1_cache_reset() {
+        q8_1_cache.clear();
+    }
+
     ggml_cuda_stream_context & stream_context() { return *concurrent_stream_context; }
 
     cublasHandle_t cublas_handle() {
@@ -1495,6 +1515,16 @@ struct ggml_backend_cuda_context {
         return pool(device);
     }
 };
+
+// Returns a buffer holding the Q8_1 quantization of src1 for this graph
+// evaluation, or nullptr so the caller allocates and quantizes itself.
+// `variant` separates layouts that are not interchangeable, since only an
+// identical layout may be shared. `hit` reports that the bytes are already
+// there and the caller must not quantize again.
+char * ggml_cuda_q8_1_cache_acquire(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src1, int variant,
+        int64_t ne_padded, int64_t s11, int64_t s12, int64_t s13,
+        size_t nbytes, bool & hit);
 
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;

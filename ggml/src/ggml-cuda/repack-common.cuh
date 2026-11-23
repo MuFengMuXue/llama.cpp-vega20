@@ -410,9 +410,39 @@ static inline block_q8_1 * repack_quantize_src1_q8_1(
         int64_t nrows, int64_t ne2, int64_t ne3, size_t nblocks,
         ggml_cuda_pool_alloc<block_q8_1> & fallback, cudaStream_t stream) {
     GGML_UNUSED(src0);
-    fallback.alloc(ctx.pool(), nblocks);
-    block_q8_1 * dstq = fallback.get();
-    quantize_row_q8_1_cuda((const float *) src1->data, dstq,
-        ne10, s11, s12, s13, ne10_padded, nrows, ne2, ne3, stream);
+    bool hit = false;
+    char * buf = ggml_cuda_q8_1_cache_acquire(ctx, src1, /*variant =*/ 0, ne10_padded,
+        s11, s12, s13, nblocks * sizeof(block_q8_1), hit);
+    if (buf == nullptr) {
+        fallback.alloc(ctx.pool(), nblocks);
+        buf = (char *) fallback.get();
+    }
+    block_q8_1 * dstq = (block_q8_1 *) buf;
+    if (!hit) {
+        quantize_row_q8_1_cuda((const float *) src1->data, dstq,
+            ne10, s11, s12, s13, ne10_padded, nrows, ne2, ne3, stream);
+    }
     return dstq;
+}
+
+// Same for the grouped layout the tiled GEMM reads. `variant` separates the
+// plain q8_1 groups (1) from the affine DS4 groups (2): the two are not
+// interchangeable, and the canonical MMQ path uses the same numbering.
+static inline block_q8_1 * repack_quantize_mmq_q8_1(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src1, ggml_type x_type, int variant,
+        int64_t ne10, int64_t ne10_padded, int64_t s11, int64_t s12, int64_t s13,
+        int64_t nrows, int64_t ne2, int64_t ne3, size_t nblocks,
+        ggml_cuda_pool_alloc<block_q8_1_mmq_h> & fallback, cudaStream_t stream) {
+    bool hit = false;
+    char * buf = ggml_cuda_q8_1_cache_acquire(ctx, src1, variant, ne10_padded,
+        s11, s12, s13, nblocks * sizeof(block_q8_1_mmq_h), hit);
+    if (buf == nullptr) {
+        fallback.alloc(ctx.pool(), nblocks);
+        buf = (char *) fallback.get();
+    }
+    if (!hit) {
+        quantize_mmq_q8_1_cuda((const float *) src1->data, nullptr, buf,
+            x_type, ne10, s11, s12, s13, ne10_padded, nrows, ne2, ne3, stream);
+    }
+    return (block_q8_1 *) buf;
 }
