@@ -56,7 +56,7 @@ PPL at c=512 is 3.5779 either way and the cli output is byte-identical at ub 256
 
 Only the repack paths use it so far. The canonical mat-vec and MMQ paths still
 quantize a fresh copy per matmul; the same hook applies at their call sites and
-would restore the gain under `--repack 0` (see P0 item 1).
+would restore the gain under `--repack 0` (see P0 item 2).
 
 ### Dense GEMM token tile: choose by matrix size and batch
 
@@ -198,14 +198,52 @@ so prefill output is not bit-identical to the old kernel.
 
 ## P0
 
-### 1. Convert the canonical paths to the quantization cache
+### 1. Allreduce: take upstream's internal two-shot for small messages (blocked)
+
+`GGML_CUDA_ALLREDUCE=internal` (upstream's own 2-way allreduce, `allreduce.cu`,
+staged through pinned host memory) is much faster at decode sizes than the NCCL
+ring on this PCIe pair, and slower at prefill sizes:
+
+| test | NCCL | internal | delta |
+|---|---:|---:|---:|
+| tg128 | 80.5 | **97.7** | **+21%** |
+| pp2048 ub512 | 2202 | 1944 | -12% |
+
+Size sweep, `ne` is elements per allreduce (ub x 2048):
+
+| ub | ne | NCCL | internal |
+|---:|---:|---:|---:|
+| 8 | 16K | 317 | 362 (+14%) |
+| 16 | 32K | 320 | 339 (+6%) |
+| 32 | 65K | 529 | 555 (+4.9%) |
+| 64 | 131K | 871 | 889 (+2.0%) |
+| 128 | 262K | 1347 | 1359 (+0.9%) |
+| 256 | 524K | 1804 | 1715 (-5%) |
+| 512 | 1M | 2202 | 1944 (-12%) |
+
+So the two paths should be selected per message size. Tried it: `comm_init_nccl`
+also brings up the internal pipeline and a dispatcher takes internal when
+`ne <= 131072` (ub 64). Decode landed at 97.7 as predicted, but **every prefill
+run hangs**: 100% CPU, both GPUs idle, 23 GB of VRAM held, no output, and it
+survives a 150 s timeout.
+
+What isolates it: the hang needs *both* paths initialized in one comm context.
+`GGML_CUDA_ALLREDUCE=internal` alone runs prefill fine (1944), and the new code
+with `GGML_CUDA_ALLREDUCE_MAX_NE=0` (dispatch forced to NCCL, pipeline still up)
+still hangs. Next suspects: `ggml_cuda_ar_pipeline_init` changes the current
+device and does not restore it, and it creates its own streams, events and pinned
+staging; check the device restore before anything else. Reverted meanwhile.
+
+Upstream is extending this path (PR #32195, 4-way internal allreduce, open).
+
+### 2. Convert the canonical paths to the quantization cache
 
 The repack paths use `ggml_cuda_q8_1_cache_acquire`; the canonical mat-vec and
 MMQ paths still quantize a fresh copy per matmul. The same hook applies at their
 call sites (`mmvq.cu`, `mmq.cu`), and it restores the gain for `--repack 0` and
 for types the repack does not cover.
 
-### 2. MoE prefill GEMM: fill the expert tiles
+### 3. MoE prefill GEMM: fill the expert tiles
 
 At pp512 there are 512*8/256 = 16 rows per expert, so a BN=32 tile is half
 padding. Weight traffic per expert is `ceil(rows_e/BN) * M * K * bpw`, which is
@@ -230,38 +268,38 @@ wider tile is not worth chasing. What is left:
   occupancy 2 vs 3 for the wide tile). Our tile is fixed at 32, which matches
   their choice up to that threshold. Measure pp8192/pp16384 before adopting.
 
-### 3. Fuse router matvec with topk (decode)
+### 4. Fuse router matvec with topk (decode)
 
 - `mul_mat_vec_f` (F32 router) 0.62 ms/token + `topk_moe` 0.47 ms/token.
 - Consider a fused router + sigmoid/scale + topk kernel in `topk-moe.cu`.
 
 ## P1
 
-### 4. Fuse MoE down with the weighted reduction
+### 5. Fuse MoE down with the weighted reduction
 
 The combine path still runs binbcast mul/add and a separate activation pass. Fuse
 the down GEMM epilogue with the per-expert weighted sum and residual. Note
 `concat_non_cont` (7.2% of prefill, 1.7 ms per call, 120 calls) belongs to the
 attention/GDN group, not to this combine path, so it is a separate item.
 
-### 5. Validate single-GPU / non-TP MoE
+### 6. Validate single-GPU / non-TP MoE
 
 Whole repacked gate/up now go through the repack fused branches, but the 20 GB
 model does not fit a 16 GB card. Test with a sliced MoE model: text and PPL
 against canonical.
 
-### 6. `repack_expert_bounds` LDS limit
+### 7. `repack_expert_bounds` LDS limit
 
 Dynamic LDS is `n_expert * 4` bytes; more than 16384 experts exceeds the 64 KB
 budget. Add a fallback if a model ever needs it.
 
-### 7. GCN `kv_rows` (optional, multi-sequence long context only)
+### 8. GCN `kv_rows` (optional, multi-sequence long context only)
 
 `ggml_flash_attn_ext_rows` is enabled only for NVIDIA Turing+ MMA
 (`fattn.cu:685`). A GCN gather kernel would help multi-slot long-context decode.
 No benefit for a single stream.
 
-### 8. IQ4_XS repack kernel
+### 9. IQ4_XS repack kernel
 
 Extend the repack path to native `GGML_TYPE_IQ4_XS` (4.25 bpw). Used by Unsloth
 UD dynamic mixes; those tensors currently stay canonical and miss the whole
