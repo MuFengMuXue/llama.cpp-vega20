@@ -35,49 +35,56 @@ static __global__ void repack_expert_bounds(const int32_t * __restrict__ ids,
 
 // MoE GEMM launch for one tile width. CW < 64 uses the narrow kernel; CW = 64
 // uses the shared 64-wide kernel (BN = 64 * TN).
-template <bool HAS_IDS, int CW, int TN, int NRL, ggml_type WT>
+template <bool HAS_IDS, int CW, int TN, int NRL, bool HAS_GATE, ggml_type WT>
 static void repack_gemm_launch_t(cudaStream_t stream,
-        const uint8_t * w, const block_q8_1 * xq, float * y,
+        const uint8_t * w, const uint8_t * w_gate, const block_q8_1 * xq, float * y,
         const uint32_t ne0, const uint32_t ne1, const uint32_t n_tok,
         const int32_t * ids_src1, const int32_t * ids_dst,
         const int32_t * expert_bounds, const int32_t * tile_off,
         const repack_tile_meta * tile_meta,
         const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1,
-        const int64_t max_tiles) {
+        const int64_t max_tiles, const ggml_glu_op glu_op) {
     const dim3 grid((unsigned) ((ne1 + MMQ_RP_Q8_BM - 1) / MMQ_RP_Q8_BM), (unsigned) max_tiles, 1);
     const dim3 block(CW, NRL, 1);
     if constexpr (CW < 64) {
-        mmq_gemm_repacked_narrow<HAS_IDS, CW, TN, NRL, WT><<<grid, block, 0, stream>>>(
-            w, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst, expert_bounds, tile_off, tile_meta,
-            n_expert, expert_stride, dst_s1);
+        if constexpr (HAS_GATE) {
+            mmq_gemm_repacked_narrow_gated<HAS_IDS, CW, TN, NRL, WT><<<grid, block, 0, stream>>>(
+                w, w_gate, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst, expert_bounds, tile_off, tile_meta,
+                n_expert, expert_stride, dst_s1, glu_op);
+        } else {
+            mmq_gemm_repacked_narrow<HAS_IDS, CW, TN, NRL, WT><<<grid, block, 0, stream>>>(
+                w, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst, expert_bounds, tile_off, tile_meta,
+                n_expert, expert_stride, dst_s1);
+        }
     } else {
+        static_assert(!HAS_GATE, "the wide tile has no fused epilogue");
         mmq_gemm_repacked<HAS_IDS, TN, NRL, WT><<<grid, block, 0, stream>>>(
             w, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst, expert_bounds, tile_off, tile_meta,
             n_expert, expert_stride, dst_s1);
     }
 }
 
-template <bool HAS_IDS, int CW, int TN, int NRL>
+template <bool HAS_IDS, int CW, int TN, int NRL, bool HAS_GATE = false>
 static void repack_gemm_launch(const ggml_type type, cudaStream_t stream,
-        const uint8_t * w, const block_q8_1 * xq, float * y,
+        const uint8_t * w, const uint8_t * w_gate, const block_q8_1 * xq, float * y,
         const uint32_t ne0, const uint32_t ne1, const uint32_t n_tok,
         const int32_t * ids_src1, const int32_t * ids_dst,
         const int32_t * expert_bounds, const int32_t * tile_off,
         const repack_tile_meta * tile_meta,
         const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1,
-        const int64_t max_tiles) {
+        const int64_t max_tiles, const ggml_glu_op glu_op = GGML_GLU_OP_REGLU) {
     switch (type) {
         case GGML_TYPE_Q8_0:
-            repack_gemm_launch_t<HAS_IDS, CW, TN, NRL, GGML_TYPE_Q8_0>(stream, w, xq, y, ne0, ne1, n_tok,
-                ids_src1, ids_dst, expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1, max_tiles);
+            repack_gemm_launch_t<HAS_IDS, CW, TN, NRL, HAS_GATE, GGML_TYPE_Q8_0>(stream, w, w_gate, xq, y, ne0, ne1, n_tok,
+                ids_src1, ids_dst, expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1, max_tiles, glu_op);
             break;
         case GGML_TYPE_Q4_0:
-            repack_gemm_launch_t<HAS_IDS, CW, TN, NRL, GGML_TYPE_Q4_0>(stream, w, xq, y, ne0, ne1, n_tok,
-                ids_src1, ids_dst, expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1, max_tiles);
+            repack_gemm_launch_t<HAS_IDS, CW, TN, NRL, HAS_GATE, GGML_TYPE_Q4_0>(stream, w, w_gate, xq, y, ne0, ne1, n_tok,
+                ids_src1, ids_dst, expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1, max_tiles, glu_op);
             break;
         default:
-            repack_gemm_launch_t<HAS_IDS, CW, TN, NRL, GGML_TYPE_IQ4_NL>(stream, w, xq, y, ne0, ne1, n_tok,
-                ids_src1, ids_dst, expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1, max_tiles);
+            repack_gemm_launch_t<HAS_IDS, CW, TN, NRL, HAS_GATE, GGML_TYPE_IQ4_NL>(stream, w, w_gate, xq, y, ne0, ne1, n_tok,
+                ids_src1, ids_dst, expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1, max_tiles, glu_op);
             break;
     }
 }
@@ -115,8 +122,8 @@ static void mul_mat_id_repacked_impl(ggml_backend_cuda_context & ctx,
     const uint8_t * w_gate = nullptr;
     if (gate != nullptr) {
         GGML_ASSERT(gate->type == src0->type);
+        GGML_ASSERT(gate->ne[0] == src0->ne[0] && gate->ne[1] == src0->ne[1]);
         GGML_ASSERT(dst->ne[0] == ne01);
-        GGML_ASSERT(n_tokens <= MMQ_RP_Q8_MOE_MMV_MAX_TOKENS);
         if (gate->view_src != nullptr && ggml_cuda_repack_tensor_supported(gate->view_src)) {
             w_gate = repack_view_get_cached(gate, gate->view_src, stream);
         } else {
@@ -173,8 +180,6 @@ static void mul_mat_id_repacked_impl(ggml_backend_cuda_context & ctx,
         return;
     }
 
-    GGML_ASSERT(gate == nullptr);   // the fused epilogue is mat-vec only
-
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), n_assign);
     ggml_cuda_pool_alloc<int32_t> ids_dst (ctx.pool(), n_assign);
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
@@ -216,9 +221,15 @@ static void mul_mat_id_repacked_impl(ggml_backend_cuda_context & ctx,
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_IQ4_NL: {
-            repack_gemm_launch<true, 32, 1, MMQ_RP_Q8_NROW_LANES * 2>(src0->type, stream, w, xq, dst_d,
-                (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols, ids_src1.get(), ids_dst.get(),
-                expert_bounds.get(), tile_off.get(), tile_meta.get(), (uint32_t) ne02, expert_stride, dst_s1, max_tiles);
+            if (gate == nullptr) {
+                repack_gemm_launch<true, 32, 1, MMQ_RP_Q8_NROW_LANES * 2>(src0->type, stream, w, nullptr, xq, dst_d,
+                    (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols, ids_src1.get(), ids_dst.get(),
+                    expert_bounds.get(), tile_off.get(), tile_meta.get(), (uint32_t) ne02, expert_stride, dst_s1, max_tiles);
+            } else {
+                repack_gemm_launch<true, 32, 1, MMQ_RP_Q8_NROW_LANES * 2, true>(src0->type, stream, w, w_gate, xq, dst_d,
+                    (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols, ids_src1.get(), ids_dst.get(),
+                    expert_bounds.get(), tile_off.get(), tile_meta.get(), (uint32_t) ne02, expert_stride, dst_s1, max_tiles, glu_op);
+            }
         } break;
         default:
             GGML_ABORT("unsupported repack type");

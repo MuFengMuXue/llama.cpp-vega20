@@ -516,15 +516,17 @@ static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_rp(
 #endif
 }
 
-template <ggml_type WT, bool HAS_IDS, int CW, int TN_, int NRL>
+template <ggml_type WT, bool HAS_IDS, int CW, int TN_, int NRL, bool HAS_GATE = false>
 static __device__ void mmq_gemm_repacked_impl(
-        const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
+        const uint8_t * __restrict__ wbase, const uint8_t * __restrict__ wbase_gate,
+        const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
         const uint32_t n_tok,
         const int32_t * __restrict__ ids_src1, const int32_t * __restrict__ ids_dst,
         const int32_t * __restrict__ expert_bounds, const int32_t * __restrict__ tile_off,
         const repack_tile_meta * __restrict__ tile_meta,
-        const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1) {
+        const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1,
+        const ggml_glu_op glu_op) {
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
     const int t  = threadIdx.x + threadIdx.y * blockDim.x;
     const int tx = threadIdx.x;
@@ -542,6 +544,9 @@ static __device__ void mmq_gemm_repacked_impl(
         a_base = meta.a_base;
         a_end  = (uint32_t) expert_bounds[e + 1];
         wbase += e * expert_stride;
+        if constexpr (HAS_GATE) {
+            wbase_gate += e * expert_stride;
+        }
         tok0   = 0;
     } else {
         GGML_UNUSED_VARS(ids_src1, ids_dst, expert_bounds, tile_off, tile_meta, n_expert, expert_stride);
@@ -556,6 +561,7 @@ static __device__ void mmq_gemm_repacked_impl(
 
     const block_q8_1_mmq_h * x_group = xmmq;
 
+
     // Q4_0 / IQ4_NL prefetch one uint4 of packed nibbles per sub-block and
     // expand once per element at the LDS store.
     // LDS stays expanded: expanding at consume instead multiplied the expand
@@ -567,6 +573,11 @@ static __device__ void mmq_gemm_repacked_impl(
     static_assert(16 % sizeof(slot_t) == 0, "slot must divide a uint4 fetch");
     constexpr int SPW = (int) (16 / sizeof(slot_t));   // slots per uint4 LDS fetch
     __shared__ slot_t   sWdh[MMQ_RP_Q8_BK][MMQ_RP_Q8_BM];
+    // Gate planes, allocated at one slot when the kernel is not fused.
+    constexpr int NG = HAS_GATE ? MMQ_RP_Q8_BM : 1;
+    __shared__ uint4    sWg_lo[NG][MMQ_RP_Q8_BK];
+    __shared__ uint4    sWg_hi[NG][MMQ_RP_Q8_BK];
+    __shared__ slot_t   sWdgh [MMQ_RP_Q8_BK][NG];
     __shared__ sXq_row_q8 sXq[BN];
     __shared__ float    sXd[BN][MMQ_RP_Q8_BK + 1];
     // Activation sums, affine types only (the [1] alternative keeps the LDS footprint of every other type unchanged).
@@ -575,6 +586,7 @@ static __device__ void mmq_gemm_repacked_impl(
 
     constexpr int NROW = MMQ_RP_Q8_BM / NRL;
     float acc[NROW][TN_] = {};
+    float acc_g[HAS_GATE ? NROW : 1][TN_] = {};
 
     constexpr int NTHREADS = CW * NRL;
     constexpr int W_ELM = MMQ_RP_Q8_BM * MMQ_RP_Q8_BK;
@@ -587,6 +599,9 @@ static __device__ void mmq_gemm_repacked_impl(
     uint4    pw_lo[W_EPT];
     uint4    pw_hi[W_EPT];
     slot_t   pw_d [W_EPT];
+    uint4    pg_lo[HAS_GATE ? W_EPT : 1];
+    uint4    pg_hi[HAS_GATE ? W_EPT : 1];
+    slot_t   pg_d [HAS_GATE ? W_EPT : 1];
     rp_x_sub px   [X_EPT];
     [[maybe_unused]] float px_s[X_EPT];
     if constexpr (HAS_IDS) {
@@ -596,7 +611,7 @@ static __device__ void mmq_gemm_repacked_impl(
         }
         __syncthreads();
     }
-    // Whole BM x BN x BK tile in-bounds -> use the unchecked loads below.
+    // Whole BM x BN x MMQ_RP_Q8_BK tile in-bounds -> use the unchecked loads below.
     const bool full_m = row0 + MMQ_RP_Q8_BM <= ne1;
     bool full_n;
     if constexpr (HAS_IDS) {
@@ -635,6 +650,33 @@ static __device__ void mmq_gemm_repacked_impl(
                 pw_lo[i] = make_uint4(0, 0, 0, 0);
                 pw_hi[i] = make_uint4(0, 0, 0, 0);
                 pw_d [i] = {};
+            }
+        }
+    };
+
+    auto prefetch_gate_checked = [&](const uint32_t sb0) {
+#pragma unroll
+        for (int i = 0; i < W_EPT; i++) {
+            const int e = t + i * NTHREADS;
+            if constexpr (W_EPT * NTHREADS != W_ELM) {
+                if (e >= W_ELM) {
+                    break;
+                }
+            }
+            const int      lr   = e / MMQ_RP_Q8_BK;
+            const int      lk   = e % MMQ_RP_Q8_BK;
+            const uint32_t sb   = sb0 + lk;
+            const uint32_t wrow = row0 + lr;
+            if (wrow < ne1 && sb < n_sub) {
+                if constexpr (RAW_REG) {
+                    rp_traits<WT>::load_w_raw(wbase_gate, wg, wrow, sb, pg_lo[i], pg_d[i]);
+                } else {
+                    rp_traits<WT>::load_w(wbase_gate, wg, wrow, sb, pg_lo[i], pg_hi[i], pg_d[i]);
+                }
+            } else {
+                pg_lo[i] = make_uint4(0, 0, 0, 0);
+                pg_hi[i] = make_uint4(0, 0, 0, 0);
+                pg_d [i] = {};
             }
         }
     };
@@ -694,6 +736,26 @@ static __device__ void mmq_gemm_repacked_impl(
         }
     };
 
+    auto prefetch_gate_full = [&](const uint32_t sb0) {
+#pragma unroll
+        for (int i = 0; i < W_EPT; i++) {
+            const int e = t + i * NTHREADS;
+            if constexpr (W_EPT * NTHREADS != W_ELM) {
+                if (e >= W_ELM) break;
+            }
+            const int lr = e / MMQ_RP_Q8_BK;
+            const int lk = e % MMQ_RP_Q8_BK;
+
+            const uint32_t wrow = row0 + lr;
+            const uint32_t sb   = sb0 + lk;
+            if constexpr (RAW_REG) {
+                rp_traits<WT>::load_w_raw(wbase_gate, wg, wrow, sb, pg_lo[i], pg_d[i]);
+            } else {
+                rp_traits<WT>::load_w(wbase_gate, wg, wrow, sb, pg_lo[i], pg_hi[i], pg_d[i]);
+            }
+        }
+    };
+
     auto prefetch_x_full = [&](const uint32_t sb0, const block_q8_1_mmq_h * x_grp) {
 #pragma unroll
         for (int i = 0; i < X_EPT; i++) {
@@ -739,6 +801,29 @@ static __device__ void mmq_gemm_repacked_impl(
             }
             sWdh [lk][lr] = pw_d[i];
         }
+        if constexpr (HAS_GATE) {
+#pragma unroll
+            for (int i = 0; i < W_EPT; i++) {
+                const int e = t + i * NTHREADS;
+                if constexpr (W_EPT * NTHREADS != W_ELM) {
+                    if (e >= W_ELM) {
+                        break;
+                    }
+                }
+                const int lr = e / MMQ_RP_Q8_BK;
+                const int lk = e % MMQ_RP_Q8_BK;
+                if constexpr (RAW_REG) {
+                    uint4 lo, hi;
+                    rp_traits<WT>::expand_raw(pg_lo[i], lo, hi);
+                    sWg_lo[lr][lk] = lo;
+                    sWg_hi[lr][lk] = hi;
+                } else {
+                    sWg_lo[lr][lk] = pg_lo[i];
+                    sWg_hi[lr][lk] = pg_hi[i];
+                }
+                sWdgh[lk][lr] = pg_d[i];
+            }
+        }
 #pragma unroll
         for (int i = 0; i < X_EPT; i++) {
             const int e = t + i * NTHREADS;
@@ -783,6 +868,9 @@ static __device__ void mmq_gemm_repacked_impl(
                 xq32[n][6] = (int) q1.z;
                 xq32[n][7] = (int) q1.w;
             }
+            // One weight matrix's rows against the activation slab in registers.
+            // Indexing is direct so the accumulators stay in VGPRs; a helper
+            // taking the arrays by pointer spills them to scratch (+5x time).
             const int row_base = ty * NROW;
             uint4 wlo = sW_lo[row_base][kk];
             uint4 whi = sW_hi[row_base][kk];
@@ -831,12 +919,65 @@ static __device__ void mmq_gemm_repacked_impl(
                     }
                 }
             }
+
+            if constexpr (HAS_GATE) {
+                uint4 glo = sWg_lo[row_base][kk];
+                uint4 ghi = sWg_hi[row_base][kk];
+                const uint4 * gdp16 = reinterpret_cast<const uint4 *>(&sWdgh[kk][row_base]);
+
+#pragma unroll
+                for (int g = 0; g < NROW; g += SPW) {
+                    const uint4 dh4 = gdp16[g / SPW];
+                    const slot_t * dh = reinterpret_cast<const slot_t *>(&dh4);
+
+#pragma unroll
+                    for (int rr = 0; rr < SPW; rr++) {
+                        const int r = g + rr;
+
+                        const uint4 wlo_c = glo, whi_c = ghi;
+                        if (r + 1 < NROW) {
+                            glo = sWg_lo[row_base + r + 1][kk];
+                            ghi = sWg_hi[row_base + r + 1][kk];
+                        }
+
+                        [[maybe_unused]] float d = 0.0f, dlo = 0.0f, dhi = 0.0f;
+                        if constexpr (rp_traits<WT>::split_scales || rp_traits<WT>::affine) {
+                            const float2 dd = rp_traits<WT>::scale2(dh[rr]);
+                            dlo = dd.x;
+                            dhi = dd.y;
+                        } else {
+                            d = rp_traits<WT>::scale(dh[rr]);
+                        }
+
+#pragma unroll
+                        for (int n = 0; n < TN_; n++) {
+                            int idot = 0;
+                            idot = ggml_cuda_dp4a((int) wlo_c.x, xq32[n][0], idot);
+                            idot = ggml_cuda_dp4a((int) whi_c.x, xq32[n][4], idot);
+                            idot = ggml_cuda_dp4a((int) wlo_c.y, xq32[n][1], idot);
+                            idot = ggml_cuda_dp4a((int) whi_c.y, xq32[n][5], idot);
+                            idot = ggml_cuda_dp4a((int) wlo_c.z, xq32[n][2], idot);
+                            idot = ggml_cuda_dp4a((int) whi_c.z, xq32[n][6], idot);
+                            idot = ggml_cuda_dp4a((int) wlo_c.w, xq32[n][3], idot);
+                            idot = ggml_cuda_dp4a((int) whi_c.w, xq32[n][7], idot);
+                            if constexpr (rp_traits<WT>::affine) {
+                                acc_g[r][n] += dlo * dx[n] * (float) idot - dhi * sx[n];
+                            } else {
+                                acc_g[r][n] += d * dx[n] * (float) idot;
+                            }
+                        }
+                    }
+                }
+            }
         }
     };
 
     // Pipelined K loop: store current slab -> sync -> prefetch next slab -> compute -> sync.
     if (full_tile) {
         prefetch_w_full(0);
+        if constexpr (HAS_GATE) {
+            prefetch_gate_full(0);
+        }
         prefetch_x_full(0, x_group);
 
         for (uint32_t sb0 = 0; sb0 < n_sub; sb0 += MMQ_RP_Q8_BK) {
@@ -844,8 +985,11 @@ static __device__ void mmq_gemm_repacked_impl(
             __syncthreads();
 
             if (sb0 + MMQ_RP_Q8_BK < n_sub) {
-                x_group += n_tok;
                 prefetch_w_full(sb0 + MMQ_RP_Q8_BK);
+                if constexpr (HAS_GATE) {
+                    prefetch_gate_full(sb0 + MMQ_RP_Q8_BK);
+                }
+                x_group += n_tok;
                 prefetch_x_full(sb0 + MMQ_RP_Q8_BK, x_group);
             }
 
@@ -854,6 +998,9 @@ static __device__ void mmq_gemm_repacked_impl(
         }
     } else {
         prefetch_w_checked(0);
+        if constexpr (HAS_GATE) {
+            prefetch_gate_checked(0);
+        }
         prefetch_x_checked(0, x_group);
 
         for (uint32_t sb0 = 0; sb0 < n_sub; sb0 += MMQ_RP_Q8_BK) {
@@ -861,8 +1008,11 @@ static __device__ void mmq_gemm_repacked_impl(
             __syncthreads();
 
             if (sb0 + MMQ_RP_Q8_BK < n_sub) {
-                x_group += n_tok;
                 prefetch_w_checked(sb0 + MMQ_RP_Q8_BK);
+                if constexpr (HAS_GATE) {
+                    prefetch_gate_checked(sb0 + MMQ_RP_Q8_BK);
+                }
+                x_group += n_tok;
                 prefetch_x_checked(sb0 + MMQ_RP_Q8_BK, x_group);
             }
 
@@ -898,19 +1048,31 @@ static __device__ void mmq_gemm_repacked_impl(
 #pragma unroll
             for (int g = 0; g < NROW; g += 4) {
                 if (vec_ok && g + 4 <= nvalid) {
-                    const float4 v = { acc[g + 0][n], acc[g + 1][n], acc[g + 2][n], acc[g + 3][n] };
+                    float4 v;
+                    if constexpr (HAS_GATE) {
+                        v = { rp_mmv_fusion_epilogue(acc[g + 0][n], acc_g[g + 0][n], nullptr, nullptr, 0u, glu_op, true),
+                              rp_mmv_fusion_epilogue(acc[g + 1][n], acc_g[g + 1][n], nullptr, nullptr, 0u, glu_op, true),
+                              rp_mmv_fusion_epilogue(acc[g + 2][n], acc_g[g + 2][n], nullptr, nullptr, 0u, glu_op, true),
+                              rp_mmv_fusion_epilogue(acc[g + 3][n], acc_g[g + 3][n], nullptr, nullptr, 0u, glu_op, true) };
+                    } else {
+                        v = { acc[g + 0][n], acc[g + 1][n], acc[g + 2][n], acc[g + 3][n] };
+                    }
                     *reinterpret_cast<float4 *>(dst + g) = v;
                 } else {
 #pragma unroll
                     for (int r = g; r < min(g + 4, nvalid); r++) {
-                        dst[r] = acc[r][n];
+                        if constexpr (HAS_GATE) {
+                            dst[r] = rp_mmv_fusion_epilogue(acc[r][n], acc_g[r][n], nullptr, nullptr, 0u, glu_op, true);
+                        } else {
+                            dst[r] = acc[r][n];
+                        }
                     }
                 }
             }
         }
     }
 #else
-    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst, expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1);
+    GGML_UNUSED_VARS(wbase, wbase_gate, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst, expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1, glu_op);
     NO_DEVICE_CODE;
 #endif
 }
@@ -927,8 +1089,8 @@ static __global__ void __launch_bounds__(64 * NRL, 2) mmq_gemm_repacked(
         const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1) {
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
     mmq_gemm_repacked_impl<WT, HAS_IDS, 64, TN_, NRL>(
-        wbase, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst,
-        expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1);
+        wbase, nullptr, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst,
+        expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1, GGML_GLU_OP_REGLU);
 #else
     GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst, expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1);
     NO_DEVICE_CODE;
@@ -1270,10 +1432,35 @@ static __global__ void __launch_bounds__(CW * NRL, 3) mmq_gemm_repacked_narrow(
         const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1) {
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
     mmq_gemm_repacked_impl<WT, HAS_IDS, CW, TN_, NRL>(
-        wbase, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst,
-        expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1);
+        wbase, nullptr, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst,
+        expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1, GGML_GLU_OP_REGLU);
 #else
     GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst, expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1);
+    NO_DEVICE_CODE;
+#endif
+}
+
+// Fused up/gate variant of the narrow tile: both weight streams share one
+// activation slab and one pass over K. The gate planes need four LDS weight
+// buffers instead of two, so this instantiation allows occupancy 2 where the
+// plain tile runs at 3. A BK=2 variant does reach 3 blocks but measured 2-7%
+// slower (pp512 2147 against 2307): the doubled slab count costs more.
+template <bool HAS_IDS, int CW, int TN_, int NRL, ggml_type WT = GGML_TYPE_Q8_0>
+static __global__ void __launch_bounds__(CW * NRL, 2) mmq_gemm_repacked_narrow_gated(
+        const uint8_t * __restrict__ wbase, const uint8_t * __restrict__ wbase_gate,
+        const block_q8_1 * __restrict__ xq, float * __restrict__ y,
+        const uint32_t ne0, const uint32_t ne1, const uint32_t n_tok,
+        const int32_t * __restrict__ ids_src1, const int32_t * __restrict__ ids_dst,
+        const int32_t * __restrict__ expert_bounds, const int32_t * __restrict__ tile_off,
+        const repack_tile_meta * __restrict__ tile_meta,
+        const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1,
+        const ggml_glu_op glu_op) {
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    mmq_gemm_repacked_impl<WT, HAS_IDS, CW, TN_, NRL, true>(
+        wbase, wbase_gate, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst,
+        expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1, glu_op);
+#else
+    GGML_UNUSED_VARS(wbase, wbase_gate, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst, expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1, glu_op);
     NO_DEVICE_CODE;
 #endif
 }

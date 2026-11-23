@@ -36,12 +36,17 @@ bool ggml_cuda_repack_mul_mat_should_fire(const ggml_tensor * src0) {
     return src0->view_src != nullptr && ggml_cuda_repack_tensor_supported(src0->view_src);
 }
 
-// Both up and gate must be repacked, and the batch must stay in the mat-vec
-// range: the GEMM path has no fused epilogue.
+// Both up and gate must be repacked. Below the mat-vec batch the fused mat-vec
+// runs, above it the fused tile GEMM; both keep one activation read.
+// GGML_CUDA_REPACK_NO_FUSE=1 restores the two independent MUL_MAT_ID nodes.
 bool ggml_cuda_repack_mul_mat_id_fused_supported(
         const ggml_tensor * src0, const ggml_tensor * gate, const ggml_tensor * ids) {
+    static const bool fuse_off = getenv("GGML_CUDA_REPACK_NO_FUSE") != nullptr;
+    if (fuse_off) {
+        return false;
+    }
     return ids != nullptr && src0 != nullptr && gate != nullptr && src0->type == gate->type &&
-        ids->ne[1] <= MMQ_RP_Q8_MOE_MMV_MAX_TOKENS &&
+        src0->ne[0] == gate->ne[0] && src0->ne[1] == gate->ne[1] &&
         ggml_cuda_repack_mul_mat_should_fire(src0) && ggml_cuda_repack_mul_mat_should_fire(gate);
 }
 

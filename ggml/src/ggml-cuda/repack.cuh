@@ -91,7 +91,8 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
     ggml_tensor * dst);
 
-// Fused up/gate/GLU for repacked MoE weights. Only the narrow mat-vec widths.
+// Fused up/gate/GLU for repacked MoE weights: mat-vec below
+// MMQ_RP_Q8_MOE_MMV_MAX_TOKENS, the gated tile GEMM above it.
 bool ggml_cuda_repack_mul_mat_id_fused_supported(
     const ggml_tensor * src0, const ggml_tensor * gate, const ggml_tensor * ids);
 
