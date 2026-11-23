@@ -405,6 +405,54 @@ affected tensors; prefill around IQ4_NL (same codebook LUT). Effort about
 Reference: `~/Projects/reinstinct/MANUAL.md` (quant table) and
 `kernels/matvec_iq4xs_repacked.cpp`, `kernels/mmq_gemm_iq4xs_repacked.cpp`.
 
+### 10. Row-split up/gate fusion (from gfx906-quartz)
+
+`iacopPBK/gfx906-quartz` fuses gate and up in one GEMM block by splitting the row
+tile: 32 rows come from the gate matrix and 32 from the up matrix, each thread
+keeps a single accumulator, and the epilogue combines them through LDS (it
+reuses the activation tile's space, `sAcc[row][token]`, and reads rows r and
+r+32).
+
+That is the opposite trade from our `mmq_gemm_repacked_narrow_gated`, which keeps
+two accumulators over the same 64 rows:
+
+| | ours | theirs |
+|---|---|---|
+| weight LDS | 16 KB (four planes) | 8 KB (one 64-row tile) |
+| accumulators | two sets | one set |
+| VGPR | 97 | not published, same shape as the plain tile |
+| blocks per CU | 2 | 2 (their token tile is 128) |
+| cost | none | twice the M tiles, so twice the activation reads |
+
+We lost occupancy 3 -> 2 to the second accumulator, and that ate most of the
+fusion's traffic win. The row-split form does not pay it, and the item it does
+pay (activation reads) is the cheap one here: the GEMM is compute bound and the
+up/gate fusion's whole traffic win was 1.3% end to end. Expected +1-2% on
+prefill, and it removes the 97 VGPR / occupancy 2 corner rather than adding one.
+
+### 11. Group blocks for L2 reuse
+
+The same GEMM launches blocks in a grouped order, so the blocks in flight share
+both weight rows and activation tiles in L2 instead of walking the grid in
+(row, token) order. It is a few lines in the launch (remap `blockIdx`), and it
+applies to the dense GEMM and to both MoE GEMMs. Untried here, so no expected
+number.
+
+### 12. Keep activations int8 between GEMMs
+
+quartz quantizes the epilogue of the up/gate GEMM straight into int8 plus scales
+and hands that to the down projection, so the activation never returns to f32
+and is never re-quantized. Our pipeline does a fresh f32 to q8_1 conversion per
+matmul; the quantization cache only removes the repeats of one input.
+
+This is the largest of the three and the most invasive, because it changes the
+shapes in the graph rather than a kernel. It is also where part of the Q8_0
+share of prefill (the dense repack GEMM, 23%) could move.
+
+All three come from reading `quartz/prefill.h` (`pf_gemm`); its `repack.h` is the
+same [N][K] int8 plus scales layout we already use, and the inner loop is the
+same 8x `sdot4`, so none of its advantage is in the dot product.
+
 ## Do not repeat
 
 - Porting llama.cpp-gfx906's custom TP allreduce (`tp-allreduce.cu`): on
