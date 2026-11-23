@@ -30,6 +30,56 @@ PPL checks that must keep matching canonical:
 - dense Q8 c=64 / c=512: 3.2568 / 3.5306
 - cli text for MoE TP2, dense Q8/Q4_0/IQ4_NL must match `--no-repack`
 
+## Upstream sync
+
+Two classes of change, with very different risk.
+
+### Fork-only files: no merge conflict possible
+
+`repack-*.{cu,cuh}` (about 3300 lines), `gated_delta_net_colthread.{cu,cuh}`
+(574), `benches/ai-gfx906` (455). Upstream does not have these files, so every
+rebase applies them untouched. All the tile, fusion and selector work lives here.
+
+### Upstream files we patch: conflict and silent-breakage risk
+
+| file | our diff | upstream commits since 2026-09-01 | risk |
+|---|---:|---:|---|
+| `src/llama-model.cpp` | +35/-21 | 89 | high |
+| `ggml/src/ggml-cuda/ggml-cuda.cu` | +145 | 87 | high, but localised |
+| `ggml/src/ggml-backend-meta.cpp` | +210 | 14 | medium |
+| `ggml/src/ggml-cuda/common.cuh` | +30 | 26 | medium |
+| `ggml/src/ggml-cuda/gated_delta_net.cu` | +8 | 4 | low |
+
+Textual conflicts are not the worry; these are the silent ones:
+
+- **`llama-model.cpp`, buft selection.** `make_gpu_buft_list` puts the extra
+  buft (the repack buffer) ahead of the default so weights prefer it. If upstream
+  reshapes that function the repack can stop firing with no error: the model
+  loads canonical weights and prefill falls back to the `--repack 0` numbers.
+- **`ggml-cuda.cu`, quantization cache.** +145 lines, mostly the q8_1 cache. The
+  fork has the same patch, so if upstream takes theirs (or moves the cache into
+  the scheduler) ours should be replaced rather than rebased.
+- **`gated_delta_net.cu`.** Our hook sits at the top of
+  `launch_gated_delta_net`. If upstream ever enables a GCN path in
+  `select_gdn_mma_path`, the hook either shadows it or becomes dead code.
+- **MoE up/gate fusion.** It fires on the "two MUL_MAT_ID plus GLU" graph shape.
+  If upstream switches to a single fused `ffn_gate_up_exps` matmul (they already
+  load its scales), the fusion stops firing silently and the 1.3% is lost.
+
+### After every upstream sync
+
+Run these four; a deviation in any of them is the signal for one of the above.
+
+| check | expected |
+|---|---:|
+| pp512 | 2457 |
+| pp2048 ub 2048 | 2975 |
+| tg128 | 79.9 |
+| PPL c=512 | 3.5779 |
+
+A cheap extra assert: if no tensor ends up in a repack buffer type after model
+load, the buft selection was disturbed.
+
 ## Done
 
 ### Activation quantization cache (prefill and decode)
