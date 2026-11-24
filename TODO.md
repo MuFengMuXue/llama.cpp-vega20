@@ -8,21 +8,25 @@ Work items after the repack decode/prefill changes.
 
 | test | result |
 |---|---:|
-| MoE pp512 | 2457 t/s |
-| MoE pp2048 ub 512 / 1024 / 2048 | 2207 / 2540 / 2975 t/s |
-| MoE tg128 | 79.9 t/s |
+| MoE pp512 | 2473 t/s |
+| MoE pp2048 ub 512 / 1024 / 2048 | 2207 / 2540 / 3027 t/s |
+| MoE tg128 | 82.0 t/s |
 | 9B dense IQ4_NL TP2 pp512 | 1927 t/s |
 | 9B dense IQ4_NL TP2 tg128 | 100.7 t/s |
 | 9B dense IQ4_NL single GPU tg128 | 78.8 t/s |
 | 9B dense Q8 single GPU pp512 / tg128 | 1240 / 58.5 t/s |
 
-Current as of `1416cfddf`. The 9B rows predate the dense tile change; re-measure
-before comparing them against anything.
+Current as of `5047467ef` (ggml-org master `ae6a7ad2c` merged). The 9B rows
+predate the dense tile change; re-measure before comparing them against
+anything.
 
 Commits: `133600a9a`, `d0695b3a1`, `4b281e210`, `931c3bd10`, `3a779a776`,
-`85b110080`, `b77535738`, `e5241bae4`, `1416cfddf`.
+`85b110080`, `b77535738`, `e5241bae4`, `1416cfddf`, `5047467ef`.
 
-PPL checks that must keep matching canonical:
+PPL checks that must keep matching canonical. Pin the corpus to a commit, for
+example `git show f5e6915c2:README.md ... > ppl.txt`: a file generated from the
+working tree picks up doc changes and moves the number by 0.5% across merges,
+which is larger than the effect of most kernel changes.
 
 - MoE c=512: 3.3537 (canonical 3.3834)
 - MoE c=2048: 4.1616 (canonical 4.1818)
@@ -68,14 +72,15 @@ Textual conflicts are not the worry; these are the silent ones:
 
 ### After every upstream sync
 
-Run these four; a deviation in any of them is the signal for one of the above.
+Run these; a deviation in any of them is the signal for one of the above.
 
 | check | expected |
 |---|---:|
-| pp512 | 2457 |
-| pp2048 ub 2048 | 2975 |
-| tg128 | 79.9 |
-| PPL c=512 | 3.5779 |
+| pp512 | 2473 |
+| pp2048 ub 2048 | 3027 |
+| pp4096 ub 4096 | 2876 |
+| tg128 | 82.0 |
+| PPL c=512 | 3.5956 on the 2026-11-24 corpus; compare within a build, not across |
 
 A cheap extra assert: if no tensor ends up in a repack buffer type after model
 load, the buft selection was disturbed.
