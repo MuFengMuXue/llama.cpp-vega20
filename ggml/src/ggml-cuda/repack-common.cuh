@@ -419,7 +419,7 @@ static inline block_q8_1 * repack_quantize_src1_q8_1(
     }
     block_q8_1 * dstq = (block_q8_1 *) buf;
     if (!hit) {
-        quantize_row_q8_1_cuda((const float *) src1->data, dstq,
+        quantize_row_q8_1_cuda(src1->data, src1->type, dstq,
             ne10, s11, s12, s13, ne10_padded, nrows, ne2, ne3, stream);
     }
     return dstq;
@@ -441,7 +441,7 @@ static inline block_q8_1 * repack_quantize_mmq_q8_1(
         buf = (char *) fallback.get();
     }
     if (!hit) {
-        quantize_mmq_q8_1_cuda((const float *) src1->data, nullptr, buf,
+        quantize_mmq_q8_1_cuda(src1->data, src1->type, nullptr, buf,
             x_type, ne10, s11, s12, s13, ne10_padded, nrows, ne2, ne3, stream);
     }
     return (block_q8_1 *) buf;
